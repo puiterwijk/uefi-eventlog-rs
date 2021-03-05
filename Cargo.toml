@@ -3,6 +3,9 @@ name = "uefi-eventlog"
 version = "0.1.0"
 authors = ["Patrick Uiterwijk <patrick@puiterwijk.org>"]
 edition = "2018"
+license = "MIT"
+homepage = "https://github.com/puiterwijk/uefi-eventlog-rs"
+description = "UEFI Event Log parser"
 
 [[bin]]
 name = "uefi-eventlog-dump"
