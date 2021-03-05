@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::convert::TryInto;
 use std::io::Read;
 use thiserror::Error;
+use uuid::Uuid;
 
 fn serialize_as_base64<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
 where
@@ -245,8 +246,6 @@ impl EfiSpecId {
     }
 }
 
-pub type GUID = [u8; 16];
-
 #[derive(Debug, Serialize)]
 pub struct EfiVariableData {
     pub variable_guid: [u8; 16],
@@ -470,6 +469,138 @@ impl DevicePath {
 }
 
 #[derive(Debug, Serialize)]
+pub struct EfiTableHeader {
+    pub signature: u64,
+    pub revision: u32,
+    pub size: u32,
+    // crc: u32
+    pub reserved: u32,
+}
+
+impl EfiTableHeader {
+    fn parse(data: &[u8]) -> Result<EfiTableHeader, EventParseError> {
+        if data.len() != 24 {
+            return Err(EventParseError::TooShort);
+        }
+        Ok(EfiTableHeader {
+            signature: LittleEndian::read_u64(&data[0..8]),
+            revision: LittleEndian::read_u32(&data[8..12]),
+            size: LittleEndian::read_u32(&data[12..16]),
+            reserved: LittleEndian::read_u32(&data[20..24]),
+        })
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct EfiPartitionHeader {
+    #[serde(flatten)]
+    pub header: EfiTableHeader,
+    pub my_lba: u64,
+    pub alternate_lba: u64,
+    pub first_usable_lba: u64,
+    pub last_usable_lba: u64,
+    pub disk_guid: Uuid,
+    pub partition_entry_lba: u64,
+    #[serde(serialize_with = "serialize_as_base64")]
+    pub reserved: Vec<u8>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EfiPartitionEntry {
+    pub partition_type: Uuid,
+    pub unique_partition_guid: Uuid,
+    pub starting_lba: u64,
+    pub ending_lba: u64,
+    pub attributes: u64,
+    pub partition_name: String,
+    #[serde(serialize_with = "serialize_as_base64")]
+    pub reserved: Vec<u8>,
+}
+
+fn parse_uuid(data: &[u8]) -> Result<Uuid, EventParseError> {
+    if data.len() != 16 {
+        return Err(EventParseError::TooShort);
+    }
+
+    // The Microsoft GUID format is.... silly
+    let data1 = LittleEndian::read_u32(&data[0..4]);
+    let data2 = LittleEndian::read_u16(&data[4..6]);
+    let data3 = LittleEndian::read_u16(&data[6..8]);
+    let data4 = &data[8..16];
+
+    Ok(Uuid::from_fields(
+        data1,
+        data2,
+        data3,
+        data4,
+    )?)
+}
+
+impl EfiPartitionEntry {
+    fn parse(data: &[u8]) -> Result<EfiPartitionEntry, EventParseError> {
+        if data.len() < 128 {
+            return Err(EventParseError::TooShort);
+        }
+
+        Ok(EfiPartitionEntry {
+            partition_type: parse_uuid(&data[0..16])?,
+            unique_partition_guid: parse_uuid(&data[16..32])?,
+            starting_lba: LittleEndian::read_u64(&data[32..40]),
+            ending_lba: LittleEndian::read_u64(&data[40..48]),
+            attributes: LittleEndian::read_u64(&data[48..56]),
+            partition_name: string_from_widechar(&data[56..128])?,
+            reserved: data[128..].to_vec(),
+        })
+    }
+}
+
+fn parse_efi_partition_data(data: &[u8]) -> Result<(EfiPartitionHeader, Vec<EfiPartitionEntry>), EventParseError> {
+    if data.len() < 24 + 64 {
+        return Err(EventParseError::TooShort);
+    }
+
+    let table_header = EfiTableHeader::parse(&data[0..24])?;
+
+    if table_header.signature != 0x5452415020494645 {
+        return Err(EventParseError::InvalidSignature);
+    }
+    if table_header.revision != 0x00010000 {
+        return Err(EventParseError::InvalidValue);
+    }
+    if data.len() < (table_header.size as usize) {
+        return Err(EventParseError::TooShort);
+    }
+
+    let size_of_partition_entry = LittleEndian::read_u32(&data[84..88]) as usize;
+
+    let mut header_end = data.len();
+    while header_end > size_of_partition_entry + (table_header.size as usize) {
+        header_end -= size_of_partition_entry;
+    }
+
+    let header = EfiPartitionHeader {
+        header: table_header,
+        my_lba: LittleEndian::read_u64(&data[24..32]),
+        alternate_lba: LittleEndian::read_u64(&data[32..40]),
+        first_usable_lba: LittleEndian::read_u64(&data[40..48]),
+        last_usable_lba: LittleEndian::read_u64(&data[48..56]),
+        disk_guid: parse_uuid(&data[56..72])?,
+        partition_entry_lba: LittleEndian::read_u64(&data[72..80]),
+        reserved: data[92..header_end].to_vec(),
+    };
+
+    let mut partitions = Vec::new();
+
+    for offset in (header_end..data.len()).step_by(size_of_partition_entry) {
+        partitions.push(
+            EfiPartitionEntry::parse(&data[offset..offset+size_of_partition_entry])?
+        );
+    }
+
+    Ok((header, partitions))
+}
+
+#[derive(Debug, Serialize)]
 pub enum SeparatorType {
     ConventionalBIOS,
     UEFI,
@@ -492,6 +623,10 @@ pub enum ParsedEventData {
         #[serde(serialize_with = "serialize_as_base64")]
         extra_data: Vec<u8>,
     },
+    GptInfo {
+        header: EfiPartitionHeader,
+        partitions: Vec<EfiPartitionEntry>,
+    },
     ValidSeparator(SeparatorType),
 }
 
@@ -509,6 +644,8 @@ pub enum EventParseError {
     Unaligned,
     #[error("An invalid value was encountered")]
     InvalidValue,
+    #[error("Invalid GUID: {0}")]
+    InvalidGuid(#[from] uuid::Error),
 }
 
 impl ParsedEventData {
@@ -551,6 +688,15 @@ impl ParsedEventData {
         Ok(ParsedEventData::FirmwareBlobLocation { base, length })
     }
 
+    fn parse_gpt_event(data: &[u8]) -> Result<ParsedEventData, EventParseError> {
+        let (header, partitions) = parse_efi_partition_data(data)?;
+
+        Ok(ParsedEventData::GptInfo {
+            header,
+            partitions,
+        })
+    }
+
     fn parse(event: EventType, data: &[u8]) -> Result<Option<ParsedEventData>, EventParseError> {
         match event {
             // EFI Events
@@ -571,8 +717,9 @@ impl ParsedEventData {
             EventType::EFIPlatformFirmwareBlob => {
                 Ok(Some(ParsedEventData::parse_efi_firmware_blob(data)?))
             }
+            EventType::EFIGptEvent => Ok(Some(ParsedEventData::parse_gpt_event(data)?)),
 
-            // EFI Event types to do: GptEvent, HandoffTables
+            // EFI Event types to do: HandoffTables
             EventType::Separator => {
                 if data == [0, 0, 0, 0] {
                     Ok(Some(ParsedEventData::ValidSeparator(SeparatorType::UEFI)))
