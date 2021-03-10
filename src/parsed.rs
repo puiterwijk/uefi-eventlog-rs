@@ -25,7 +25,7 @@ fn string_from_widechar(wchar: &[u8]) -> Result<String, EventParseError> {
 
 #[derive(Debug, Serialize)]
 pub struct EfiVariableData {
-    pub variable_guid: [u8; 16],
+    pub variable_guid: Uuid,
     pub name: String,
     #[serde(serialize_with = "serialize_as_base64")]
     pub data: Vec<u8>,
@@ -34,6 +34,8 @@ pub struct EfiVariableData {
 impl EfiVariableData {
     fn parse(data: &[u8]) -> Result<EfiVariableData, EventParseError> {
         let variable_guid = &data[0..16];
+        let variable_guid: [u8; 16] = variable_guid.try_into().unwrap();
+        let variable_guid = Uuid::from_bytes(variable_guid);
         let num_name_chars = LittleEndian::read_u64(&data[16..24]);
         let name_len = (num_name_chars * 2) as usize;
         let data_len = LittleEndian::read_u64(&data[24..32]) as usize;
@@ -48,7 +50,7 @@ impl EfiVariableData {
         let name = string_from_widechar(name_data)?;
 
         Ok(EfiVariableData {
-            variable_guid: variable_guid.try_into().unwrap(),
+            variable_guid,
             name,
             data,
         })

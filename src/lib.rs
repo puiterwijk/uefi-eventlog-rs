@@ -1,11 +1,14 @@
+use std::io::Read;
+
 use byteorder::{LittleEndian, ReadBytesExt};
 use fallible_iterator::FallibleIterator;
 use log::{info, trace};
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
+use openssl::{hash::hash, memcmp};
 use serde::Serialize;
-use std::io::Read;
 use thiserror::Error;
+use tpmless_tpm2::{DigestAlgorithm, PcrExtender, PcrExtenderBuilder};
 
 pub mod parsed;
 
@@ -24,10 +27,18 @@ pub enum Error {
     PreviousIteration,
     #[error("End of file reached")]
     Eof,
-    #[error("Unsupported digest method {0} encountered")]
-    UnsupportedDigestMethod(u16),
     #[error("Error parsing event: {0}")]
     EventParse(#[from] parsed::EventParseError),
+    #[error("Unsupported digest method {0:x} used")]
+    UnsupportedDigestMethod(u16),
+    #[error("TPMless error")]
+    Tpmless(#[from] tpmless_tpm2::Error),
+    #[error("Event had invalid digest value")]
+    InvalidEventDigest,
+    #[error("Cryptographic error occured")]
+    Crypto(#[from] openssl::error::ErrorStack),
+    #[error("Error decoding utf8 string")]
+    StrUtf8(#[from] std::str::Utf8Error),
 }
 
 fn map_eof(e: std::io::Error) -> Error {
@@ -125,59 +136,112 @@ pub enum EventType {
 
 impl From<u32> for EventType {
     fn from(raw: u32) -> Self {
-        if let Some(known) = KnownEventType::from_u32(raw) {
-            match known {
-                KnownEventType::PrebootCert => EventType::PrebootCert,
-                KnownEventType::PostCode => EventType::PostCode,
-                KnownEventType::Unused => EventType::Unused,
-                KnownEventType::NoAction => EventType::NoAction,
-                KnownEventType::Separator => EventType::Separator,
-                KnownEventType::Action => EventType::Action,
-                KnownEventType::EventTag => EventType::EventTag,
-                KnownEventType::CrtmContents => EventType::CrtmContents,
-                KnownEventType::CrtmVersion => EventType::CrtmVersion,
-                KnownEventType::CpuMicrocode => EventType::CpuMicrocode,
-                KnownEventType::PlatformConfigFlags => EventType::PlatformConfigFlags,
-                KnownEventType::TableOfDevices => EventType::TableOfDevices,
-                KnownEventType::CompactHash => EventType::CompactHash,
-                KnownEventType::IPL => EventType::IPL,
-                KnownEventType::IPLPartitionData => EventType::IPLPartitionData,
-                KnownEventType::NonhostCode => EventType::NonhostCode,
-                KnownEventType::NonhostConfig => EventType::NonhostConfig,
-                KnownEventType::NonhostInfo => EventType::NonhostInfo,
-                KnownEventType::OmitbootDeviceEvents => EventType::OmitbootDeviceEvents,
-                KnownEventType::EFIVariableDriverConfig => EventType::EFIVariableDriverConfig,
-                KnownEventType::EFIVariableBoot => EventType::EFIVariableBoot,
-                KnownEventType::EFIBootServicesApplication => EventType::EFIBootServicesApplication,
-                KnownEventType::EFIBootServicesDriver => EventType::EFIBootServicesDriver,
-                KnownEventType::EFIRuntimeServicesDriver => EventType::EFIRuntimeServicesDriver,
-                KnownEventType::EFIGptEvent => EventType::EFIGptEvent,
-                KnownEventType::EFIAction => EventType::EFIAction,
-                KnownEventType::EFIPlatformFirmwareBlob => EventType::EFIPlatformFirmwareBlob,
-                KnownEventType::EFIHandoffTables => EventType::EFIHandoffTables,
-                KnownEventType::EFIVariableAuthority => EventType::EFIVariableAuthority,
-            }
-        } else {
-            EventType::Unknown(raw)
+        match KnownEventType::from_u32(raw) {
+            Some(val) => val.into(),
+            None => EventType::Unknown(raw),
         }
     }
 }
 
-#[derive(Debug, FromPrimitive, Serialize)]
-#[repr(u16)]
-#[serde(rename_all = "lowercase")]
-pub enum DigestMethod {
-    Sha1 = 0x0004,
-    Sha256 = 0x000B,
-    Sha384 = 0x000C,
-    Sha512 = 0x000D,
+impl From<EventType> for u32 {
+    fn from(et: EventType) -> Self {
+        match et {
+            EventType::Unknown(v) => v,
+            _ => et.to_known().unwrap() as u32,
+        }
+    }
+}
+
+impl EventType {
+    fn to_known(&self) -> Option<KnownEventType> {
+        Some(match self {
+            EventType::PrebootCert => KnownEventType::PrebootCert,
+            EventType::PostCode => KnownEventType::PostCode,
+            EventType::Unused => KnownEventType::Unused,
+            EventType::NoAction => KnownEventType::NoAction,
+            EventType::Separator => KnownEventType::Separator,
+            EventType::Action => KnownEventType::Action,
+            EventType::EventTag => KnownEventType::EventTag,
+            EventType::CrtmContents => KnownEventType::CrtmContents,
+            EventType::CrtmVersion => KnownEventType::CrtmVersion,
+            EventType::CpuMicrocode => KnownEventType::CpuMicrocode,
+            EventType::PlatformConfigFlags => KnownEventType::PlatformConfigFlags,
+            EventType::TableOfDevices => KnownEventType::TableOfDevices,
+            EventType::CompactHash => KnownEventType::CompactHash,
+            EventType::IPL => KnownEventType::IPL,
+            EventType::IPLPartitionData => KnownEventType::IPLPartitionData,
+            EventType::NonhostCode => KnownEventType::NonhostCode,
+            EventType::NonhostConfig => KnownEventType::NonhostConfig,
+            EventType::NonhostInfo => KnownEventType::NonhostInfo,
+            EventType::OmitbootDeviceEvents => KnownEventType::OmitbootDeviceEvents,
+            EventType::EFIVariableDriverConfig => KnownEventType::EFIVariableDriverConfig,
+            EventType::EFIVariableBoot => KnownEventType::EFIVariableBoot,
+            EventType::EFIBootServicesApplication => KnownEventType::EFIBootServicesApplication,
+            EventType::EFIBootServicesDriver => KnownEventType::EFIBootServicesDriver,
+            EventType::EFIRuntimeServicesDriver => KnownEventType::EFIRuntimeServicesDriver,
+            EventType::EFIGptEvent => KnownEventType::EFIGptEvent,
+            EventType::EFIAction => KnownEventType::EFIAction,
+            EventType::EFIPlatformFirmwareBlob => KnownEventType::EFIPlatformFirmwareBlob,
+            EventType::EFIHandoffTables => KnownEventType::EFIHandoffTables,
+            EventType::EFIVariableAuthority => KnownEventType::EFIVariableAuthority,
+            EventType::Unknown(_) => return None,
+        })
+    }
+}
+
+impl From<KnownEventType> for EventType {
+    fn from(ket: KnownEventType) -> Self {
+        match ket {
+            KnownEventType::PrebootCert => EventType::PrebootCert,
+            KnownEventType::PostCode => EventType::PostCode,
+            KnownEventType::Unused => EventType::Unused,
+            KnownEventType::NoAction => EventType::NoAction,
+            KnownEventType::Separator => EventType::Separator,
+            KnownEventType::Action => EventType::Action,
+            KnownEventType::EventTag => EventType::EventTag,
+            KnownEventType::CrtmContents => EventType::CrtmContents,
+            KnownEventType::CrtmVersion => EventType::CrtmVersion,
+            KnownEventType::CpuMicrocode => EventType::CpuMicrocode,
+            KnownEventType::PlatformConfigFlags => EventType::PlatformConfigFlags,
+            KnownEventType::TableOfDevices => EventType::TableOfDevices,
+            KnownEventType::CompactHash => EventType::CompactHash,
+            KnownEventType::IPL => EventType::IPL,
+            KnownEventType::IPLPartitionData => EventType::IPLPartitionData,
+            KnownEventType::NonhostCode => EventType::NonhostCode,
+            KnownEventType::NonhostConfig => EventType::NonhostConfig,
+            KnownEventType::NonhostInfo => EventType::NonhostInfo,
+            KnownEventType::OmitbootDeviceEvents => EventType::OmitbootDeviceEvents,
+            KnownEventType::EFIVariableDriverConfig => EventType::EFIVariableDriverConfig,
+            KnownEventType::EFIVariableBoot => EventType::EFIVariableBoot,
+            KnownEventType::EFIBootServicesApplication => EventType::EFIBootServicesApplication,
+            KnownEventType::EFIBootServicesDriver => EventType::EFIBootServicesDriver,
+            KnownEventType::EFIRuntimeServicesDriver => EventType::EFIRuntimeServicesDriver,
+            KnownEventType::EFIGptEvent => EventType::EFIGptEvent,
+            KnownEventType::EFIAction => EventType::EFIAction,
+            KnownEventType::EFIPlatformFirmwareBlob => EventType::EFIPlatformFirmwareBlob,
+            KnownEventType::EFIHandoffTables => EventType::EFIHandoffTables,
+            KnownEventType::EFIVariableAuthority => EventType::EFIVariableAuthority,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
 pub struct Digest {
-    method: DigestMethod,
+    method: DigestAlgorithm,
     #[serde(serialize_with = "serialize_as_base64")]
     digest: Vec<u8>,
+}
+
+impl Digest {
+    fn verify(&self, data: &[u8]) -> Result<(), Error> {
+        let computed = hash(self.method.openssl_md(), data)?;
+
+        if memcmp::eq(&self.digest, &computed) {
+            Ok(())
+        } else {
+            Err(Error::InvalidEventDigest)
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -185,9 +249,77 @@ pub struct Event {
     pub pcr_index: u32,
     pub event: EventType,
     pub digests: Vec<Digest>,
+    pub digest_verification_status: DigestVerificationStatus,
     #[serde(serialize_with = "serialize_as_base64")]
     pub data: Vec<u8>,
     pub parsed_data: Option<parsed::ParsedEventData>,
+}
+
+impl Event {
+    fn strip_grub_prefix(&self) -> Result<&[u8], Error> {
+        let data = std::str::from_utf8(&self.data)?;
+        match data.find(": ") {
+            None => Ok(data.as_bytes()),
+            Some(pos) => Ok(data[(pos + 2)..data.len() - 1].as_bytes()),
+        }
+    }
+
+    fn confirm_digests(&mut self) -> Result<(), Error> {
+        // For some types of data, we can't even verify
+        let data_to_confirm: Option<&[u8]> = match self.event {
+            // NoAction is explicitly not measured or verified
+            EventType::NoAction => None,
+
+            // These EFI values we are unable to verify as the event doesn't contain all data
+            EventType::EFIPlatformFirmwareBlob => None,
+            EventType::EFIBootServicesApplication => None,
+
+            // These EFI values we don't verify but TODO
+            EventType::EFIHandoffTables => None,
+            EventType::EFIVariableBoot => None,
+
+            // Grub
+            EventType::IPL => {
+                // 8 is the GRUB_STRING_PCR
+                if self.pcr_index == 8 {
+                    Some(self.strip_grub_prefix()?)
+                } else {
+                    None
+                }
+            }
+
+            // For these events, we reconstruct the pcr_event structure
+            EventType::PostCode => None,
+
+            // Everything else, assume it's the full data blob
+            _ => Some(&self.data),
+        };
+
+        if let Some(data_to_confirm) = data_to_confirm {
+            for dig in &self.digests {
+                match dig.verify(&data_to_confirm) {
+                    Ok(()) => {}
+                    Err(_) => {
+                        self.digest_verification_status = DigestVerificationStatus::Invalid;
+                        break;
+                    }
+                }
+            }
+            self.digest_verification_status = DigestVerificationStatus::Verified;
+        }
+
+        Ok(())
+    }
+
+    fn extend(&self, ext: &mut PcrExtender) -> Result<(), Error> {
+        if self.event != EventType::NoAction {
+            for dig in &self.digests {
+                ext.extend_digest(self.pcr_index, dig.method, &dig.digest)?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -196,6 +328,8 @@ pub struct Parser<R: Read> {
     logtype: Option<LogType>,
     log_info: Option<parsed::EfiSpecId>,
     last_error: Option<Error>,
+    pcr_extender: PcrExtender,
+    any_invalid: bool,
 }
 
 impl<R: Read> Parser<R> {
@@ -205,12 +339,35 @@ impl<R: Read> Parser<R> {
             logtype: None,
             log_info: None,
             last_error: None,
+            any_invalid: false,
+            pcr_extender: PcrExtenderBuilder::new()
+                .add_digest_method(DigestAlgorithm::Sha1)
+                .add_digest_method(DigestAlgorithm::Sha256)
+                .add_digest_method(DigestAlgorithm::Sha384)
+                .add_digest_method(DigestAlgorithm::Sha512)
+                .build(),
         }
+    }
+
+    pub fn pcrs(self) -> PcrExtender {
+        self.pcr_extender
+    }
+
+    pub fn any_invalid(&self) -> bool {
+        self.any_invalid
     }
 }
 
 fn zeroed_vec(len: usize) -> Vec<u8> {
     vec![0; len]
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DigestVerificationStatus {
+    Unattempted,
+    Invalid,
+    Verified,
 }
 
 impl<R: Read> Parser<R> {
@@ -234,7 +391,7 @@ impl<R: Read> Parser<R> {
 
         // Build up event structure
         let digests = vec![Digest {
-            method: DigestMethod::Sha1,
+            method: DigestAlgorithm::Sha1,
             digest: digestbuf,
         }];
 
@@ -242,6 +399,7 @@ impl<R: Read> Parser<R> {
             pcr_index,
             event: event_type,
             digests,
+            digest_verification_status: DigestVerificationStatus::Unattempted,
             data: eventbuf,
             parsed_data,
         })
@@ -260,7 +418,7 @@ impl<R: Read> Parser<R> {
         let mut digests = Vec::with_capacity(digest_count as usize);
         for _ in 0..digest_count {
             let raw_algo = self.reader.read_u16::<LittleEndian>()?;
-            let algo = match DigestMethod::from_u16(raw_algo) {
+            let algo = match DigestAlgorithm::from_tpm_alg_id(raw_algo) {
                 None => return Err(Error::UnsupportedDigestMethod(raw_algo)),
                 Some(v) => v,
             };
@@ -299,6 +457,7 @@ impl<R: Read> Parser<R> {
             pcr_index,
             event: event_type,
             digests,
+            digest_verification_status: DigestVerificationStatus::Unattempted,
             data: eventbuf,
             parsed_data,
         })
@@ -311,11 +470,14 @@ impl<R: Read> FallibleIterator for Parser<R> {
 
     fn next(&mut self) -> Result<Option<Event>, Error> {
         if self.logtype.is_none() {
-            let firstevent = match self.parse_pcr_event() {
+            let mut firstevent = match self.parse_pcr_event() {
                 Err(Error::Eof) => return Ok(None),
                 Err(e) => return Err(e),
                 Ok(val) => val,
             };
+
+            firstevent.confirm_digests()?;
+            firstevent.extend(&mut self.pcr_extender)?;
 
             trace!("First event: {:?}", firstevent);
 
@@ -345,15 +507,144 @@ impl<R: Read> FallibleIterator for Parser<R> {
         match new_event {
             Err(Error::Eof) => Ok(None),
             Err(e) => Err(e),
-            Ok(val) => Ok(Some(val)),
+            Ok(mut val) => {
+                val.confirm_digests()?;
+                if val.digest_verification_status == DigestVerificationStatus::Invalid {
+                    self.any_invalid = true;
+                }
+                val.extend(&mut self.pcr_extender)?;
+                Ok(Some(val))
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+    use std::path::Path;
+
+    use fallible_iterator::FallibleIterator;
+    use tpmless_tpm2::DigestAlgorithm;
+
+    use crate::{DigestVerificationStatus, Parser};
+
     #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
+    fn parse_bootlog() {
+        let dirname = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fname = dirname.join("test_assets/bootlog");
+        let file = File::open(&fname).expect("Test asset opening failed");
+
+        let mut parser = Parser::new(file);
+
+        while let Some(event) = parser.next().expect("Failed to parse event") {
+            assert!(event.digest_verification_status != DigestVerificationStatus::Invalid);
+
+            // All grub string events are validated
+            if event.pcr_index == 8 {
+                assert_eq!(
+                    event.digest_verification_status,
+                    DigestVerificationStatus::Verified
+                );
+            }
+        }
+
+        assert!(!parser.any_invalid());
+
+        let pcrvals = parser.pcrs();
+
+        // Sha1 bank
+        assert_eq!(
+            pcrvals.pcr_algo_value(0, DigestAlgorithm::Sha1).unwrap(),
+            hex::decode("F080580492B92735CA943D0F58DA3BAE4DCCDD23").unwrap(),
+        );
+        assert_eq!(
+            pcrvals.pcr_algo_value(1, DigestAlgorithm::Sha1).unwrap(),
+            hex::decode("0319C44D0BA23140F64E1FCF5CAB2136EEC45DC8").unwrap(),
+        );
+        assert_eq!(
+            pcrvals.pcr_algo_value(2, DigestAlgorithm::Sha1).unwrap(),
+            hex::decode("B2A83B0EBF2F8374299A5B2BDFC31EA955AD7236").unwrap(),
+        );
+        assert_eq!(
+            pcrvals.pcr_algo_value(3, DigestAlgorithm::Sha1).unwrap(),
+            hex::decode("B2A83B0EBF2F8374299A5B2BDFC31EA955AD7236").unwrap(),
+        );
+        assert_eq!(
+            pcrvals.pcr_algo_value(4, DigestAlgorithm::Sha1).unwrap(),
+            hex::decode("6938A4AA133B3F2CEAED34C5D69957A77CB615E8").unwrap(),
+        );
+        assert_eq!(
+            pcrvals.pcr_algo_value(5, DigestAlgorithm::Sha1).unwrap(),
+            hex::decode("6E3958C581B8999ED37C6A7D4EE9B0CED4E1FF0E").unwrap(),
+        );
+        assert_eq!(
+            pcrvals.pcr_algo_value(6, DigestAlgorithm::Sha1).unwrap(),
+            hex::decode("B2A83B0EBF2F8374299A5B2BDFC31EA955AD7236").unwrap(),
+        );
+        assert_eq!(
+            pcrvals.pcr_algo_value(7, DigestAlgorithm::Sha1).unwrap(),
+            hex::decode("6D7206871C9C6F38AD3997BACEEBEE95DADEC04D").unwrap(),
+        );
+        assert_eq!(
+            pcrvals.pcr_algo_value(8, DigestAlgorithm::Sha1).unwrap(),
+            hex::decode("8C882017B021990D5D1EB3F71D9020C21605439B").unwrap(),
+        );
+        assert_eq!(
+            pcrvals.pcr_algo_value(9, DigestAlgorithm::Sha1).unwrap(),
+            hex::decode("80BB2AF0DFD10FECE3AFB74A8BE8DB590A95322D").unwrap(),
+        );
+
+        // Sha256 bank
+        assert_eq!(
+            pcrvals.pcr_algo_value(0, DigestAlgorithm::Sha256).unwrap(),
+            hex::decode("DE5BAE1801B1055914582F526FEA0AA68E7DFACB4A5AD6CE55F8B2B6287C475C")
+                .unwrap(),
+        );
+        assert_eq!(
+            pcrvals.pcr_algo_value(1, DigestAlgorithm::Sha256).unwrap(),
+            hex::decode("3D086AEE80EFF0B9D930CE43EC0D3ECBE73EA2F188E545FECC8D97E9ACF9F61F")
+                .unwrap(),
+        );
+        assert_eq!(
+            pcrvals.pcr_algo_value(2, DigestAlgorithm::Sha256).unwrap(),
+            hex::decode("3D458CFE55CC03EA1F443F1562BEEC8DF51C75E14A9FCF9A7234A13F198E7969")
+                .unwrap(),
+        );
+        assert_eq!(
+            pcrvals.pcr_algo_value(3, DigestAlgorithm::Sha256).unwrap(),
+            hex::decode("3D458CFE55CC03EA1F443F1562BEEC8DF51C75E14A9FCF9A7234A13F198E7969")
+                .unwrap(),
+        );
+        assert_eq!(
+            pcrvals.pcr_algo_value(4, DigestAlgorithm::Sha256).unwrap(),
+            hex::decode("E79EBF94D2013D91808B2B250FCFB08260F73E6FD636704C0783EDB641BAECDD")
+                .unwrap(),
+        );
+        assert_eq!(
+            pcrvals.pcr_algo_value(5, DigestAlgorithm::Sha256).unwrap(),
+            hex::decode("405F63FB377A6992CE75213C5D4E847BDFDBF2523DF3774573DE4E07C656A143")
+                .unwrap(),
+        );
+        assert_eq!(
+            pcrvals.pcr_algo_value(6, DigestAlgorithm::Sha256).unwrap(),
+            hex::decode("3D458CFE55CC03EA1F443F1562BEEC8DF51C75E14A9FCF9A7234A13F198E7969")
+                .unwrap(),
+        );
+        assert_eq!(
+            pcrvals.pcr_algo_value(7, DigestAlgorithm::Sha256).unwrap(),
+            hex::decode("730777CFA2B4C2CF67A54CE7C80D7D15CEBD0A443D1BC320E43FE338812EA67B")
+                .unwrap(),
+        );
+        assert_eq!(
+            pcrvals.pcr_algo_value(8, DigestAlgorithm::Sha256).unwrap(),
+            hex::decode("4788238034043585FD5254CD186D90ECA91D9911E2D7B1BDDE9EEE81704306DB")
+                .unwrap(),
+        );
+        assert_eq!(
+            pcrvals.pcr_algo_value(9, DigestAlgorithm::Sha256).unwrap(),
+            hex::decode("6E22C7993F14C2313665A86EDC9998EAD5361D95C841DACCCEF6A52BDB4BF935")
+                .unwrap(),
+        );
     }
 }

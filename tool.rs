@@ -1,6 +1,8 @@
 use fallible_iterator::FallibleIterator;
+use serde::Serialize;
 use std::{env, fs::File};
 use thiserror::Error;
+use tpmless_tpm2::PcrExtender;
 
 use uefi_eventlog::{Event, Parser};
 
@@ -14,6 +16,12 @@ enum ToolError {
     Yaml(#[from] serde_yaml::Error),
 }
 
+#[derive(Debug, Serialize)]
+struct Results {
+    events: Vec<Event>,
+    pcrs: PcrExtender,
+}
+
 fn main() -> Result<(), ToolError> {
     pretty_env_logger::init();
 
@@ -23,10 +31,28 @@ fn main() -> Result<(), ToolError> {
 
     for filename in args {
         let file = File::open(&filename)?;
-        let parser = Parser::new(file);
-        let events: Vec<Event> = parser.collect()?;
+        let mut parser = Parser::new(file);
+        let mut events: Vec<Event> = Vec::new();
 
-        serde_yaml::to_writer(std::io::stdout(), &events)?;
+        while let Some(event) = parser.next()? {
+            events.push(event);
+        }
+
+        let any_invalid = parser.any_invalid();
+
+        serde_yaml::to_writer(
+            std::io::stdout(),
+            &Results {
+                events,
+                pcrs: parser.pcrs(),
+            },
+        )?;
+
+        if any_invalid {
+            eprintln!("CAUTION: Invalid PCR values encountered!");
+        }
+
+        std::process::exit(1);
     }
 
     Ok(())
