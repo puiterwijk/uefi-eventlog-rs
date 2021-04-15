@@ -305,7 +305,9 @@ impl Event {
                     }
                 }
             }
-            self.digest_verification_status = DigestVerificationStatus::Verified;
+            if let DigestVerificationStatus::Unattempted = self.digest_verification_status {
+                self.digest_verification_status = DigestVerificationStatus::Verified;
+            }
         }
 
         Ok(())
