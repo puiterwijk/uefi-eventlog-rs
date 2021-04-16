@@ -252,7 +252,7 @@ pub struct Event {
     pub digest_verification_status: DigestVerificationStatus,
     #[serde(serialize_with = "serialize_as_base64")]
     pub data: Vec<u8>,
-    pub parsed_data: Option<parsed::ParsedEventData>,
+    pub parsed_data: Option<Result<parsed::ParsedEventData, parsed::EventParseError>>,
 }
 
 impl Event {
@@ -325,17 +325,45 @@ impl Event {
 }
 
 #[derive(Debug)]
-pub struct Parser<R: Read> {
+pub struct ParseSettings {
+    // Workarounds for broken logs
+    workaround_string_00af: bool,
+}
+
+impl Default for ParseSettings {
+    fn default() -> ParseSettings {
+        ParseSettings {
+            workaround_string_00af: false,
+
+        }
+    }
+}
+
+impl ParseSettings {
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    pub fn set_workaround_string_00af(&mut self, enabled: bool) {
+        self.workaround_string_00af = enabled;
+    }
+}
+
+#[derive(Debug)]
+pub struct Parser<'set, R: Read> {
     reader: R,
     logtype: Option<LogType>,
     log_info: Option<parsed::EfiSpecId>,
     last_error: Option<Error>,
     pcr_extender: PcrExtender,
     any_invalid: bool,
+
+    // Settings
+    settings: &'set ParseSettings,
 }
 
-impl<R: Read> Parser<R> {
-    pub fn new(reader: R) -> Self {
+impl<'set, R: Read> Parser<'set, R> {
+    pub fn new(reader: R, settings: &'set ParseSettings) -> Self {
         Parser {
             reader,
             logtype: None,
@@ -348,6 +376,8 @@ impl<R: Read> Parser<R> {
                 .add_digest_method(DigestAlgorithm::Sha384)
                 .add_digest_method(DigestAlgorithm::Sha512)
                 .build(),
+
+            settings,
         }
     }
 
@@ -372,7 +402,15 @@ pub enum DigestVerificationStatus {
     Verified,
 }
 
-impl<R: Read> Parser<R> {
+fn invert_opt_res<T, E>(input: Result<Option<T>, E>) -> Option<Result<T, E>> {
+    match input {
+        Ok(None) => None,
+        Ok(Some(val)) => Some(Ok(val)),
+        Err(e) => Some(Err(e)),
+    }
+}
+
+impl<R: Read> Parser<'_, R> {
     fn parse_pcr_event(&mut self) -> Result<Event, Error> {
         // PCR Index
         let pcr_index = self.reader.read_u32::<LittleEndian>().map_err(map_eof)?;
@@ -389,7 +427,8 @@ impl<R: Read> Parser<R> {
         self.reader.read_exact(&mut eventbuf)?;
 
         // Possibly parse
-        let parsed_data = parsed::ParsedEventData::parse(event_type, &eventbuf)?;
+        let parsed_data = parsed::ParsedEventData::parse(event_type, &eventbuf, self.settings);
+        let parsed_data = invert_opt_res(parsed_data);
 
         // Build up event structure
         let digests = vec![Digest {
@@ -452,7 +491,8 @@ impl<R: Read> Parser<R> {
         );
 
         // Possibly parse
-        let parsed_data = parsed::ParsedEventData::parse(event_type, &eventbuf)?;
+        let parsed_data = parsed::ParsedEventData::parse(event_type, &eventbuf, self.settings);
+        let parsed_data = invert_opt_res(parsed_data);
 
         // Build up Event structure
         Ok(Event {
@@ -466,7 +506,7 @@ impl<R: Read> Parser<R> {
     }
 }
 
-impl<R: Read> FallibleIterator for Parser<R> {
+impl<R: Read> FallibleIterator for Parser<'_, R> {
     type Item = Event;
     type Error = Error;
 
@@ -536,8 +576,9 @@ mod tests {
         let dirname = Path::new(env!("CARGO_MANIFEST_DIR"));
         let fname = dirname.join("test_assets/bootlog");
         let file = File::open(&fname).expect("Test asset opening failed");
+        let settings = Default::default();
 
-        let mut parser = Parser::new(file);
+        let mut parser = Parser::new(file, &settings);
 
         while let Some(event) = parser.next().expect("Failed to parse event") {
             assert!(event.digest_verification_status != DigestVerificationStatus::Invalid);

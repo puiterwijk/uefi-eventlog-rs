@@ -6,7 +6,7 @@ use std::{collections::HashMap, convert::TryInto};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{serialize_as_base64, EventType};
+use crate::{serialize_as_base64, EventType, ParseSettings};
 
 fn string_from_widechar(wchar: &[u8]) -> Result<String, EventParseError> {
     let (head, wchar, tail) = unsafe { wchar.align_to::<u16>() };
@@ -406,7 +406,7 @@ pub enum ParsedEventData {
     ValidSeparator(SeparatorType),
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Serialize)]
 pub enum EventParseError {
     #[error("Text decoding error")]
     TextDecoding,
@@ -421,11 +421,21 @@ pub enum EventParseError {
     #[error("An invalid value was encountered")]
     InvalidValue,
     #[error("Invalid GUID: {0}")]
-    InvalidGuid(#[from] uuid::Error),
+    InvalidGuid(String),
+}
+
+impl From<uuid::Error> for EventParseError {
+    fn from(err: uuid::Error) -> EventParseError {
+        EventParseError::InvalidGuid(format!("{:?}", err))
+    }
 }
 
 impl ParsedEventData {
-    fn parse_efi_text(data: &[u8]) -> Result<ParsedEventData, EventParseError> {
+    fn parse_efi_text(mut data: &[u8], settings: &ParseSettings) -> Result<ParsedEventData, EventParseError> {
+        if settings.workaround_string_00af && data[data.len()-2] == 0x00 && data[data.len()-1] == 0xaf {
+            data = &data[..data.len()-1];
+        }
+
         Ok(ParsedEventData::Text(
             std::str::from_utf8(data)
                 .map_err(|_| EventParseError::TextDecoding)?
@@ -473,6 +483,7 @@ impl ParsedEventData {
     pub(crate) fn parse(
         event: EventType,
         data: &[u8],
+        settings: &ParseSettings,
     ) -> Result<Option<ParsedEventData>, EventParseError> {
         match event {
             // EFI Events
@@ -483,7 +494,7 @@ impl ParsedEventData {
                 EfiVariableData::parse(data)?,
             ))),
             EventType::PostCode | EventType::IPL | EventType::EFIAction => {
-                Ok(Some(ParsedEventData::parse_efi_text(data)?))
+                Ok(Some(ParsedEventData::parse_efi_text(data, &settings)?))
             }
             EventType::EFIBootServicesApplication
             | EventType::EFIBootServicesDriver
