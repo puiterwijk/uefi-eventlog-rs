@@ -28,6 +28,7 @@ fn main() -> Result<(), ToolError> {
     let mut args = env::args();
     // Ignore our binary name
     args.next();
+    let mut any_failures = false;
 
     for filename in args {
         let file = File::open(&filename)?;
@@ -50,8 +51,12 @@ fn main() -> Result<(), ToolError> {
 
         if any_invalid {
             eprintln!("CAUTION: Invalid PCR values encountered!");
+            any_failures = true;
         }
 
+    }
+
+    if any_failures {
         std::process::exit(1);
     }
 
