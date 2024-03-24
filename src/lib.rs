@@ -227,9 +227,9 @@ impl From<KnownEventType> for EventType {
 
 #[derive(Debug, Serialize)]
 pub struct Digest {
-    method: DigestAlgorithm,
+    pub method: DigestAlgorithm,
     #[serde(serialize_with = "serialize_as_base64")]
-    digest: Vec<u8>,
+    pub digest: Vec<u8>,
 }
 
 impl Digest {
