@@ -242,6 +242,14 @@ impl Digest {
             Err(Error::InvalidEventDigest)
         }
     }
+
+    pub fn digest(&self) -> Vec<u8> {
+        self.digest.clone()
+    }
+
+    pub fn into_digest(self) -> Vec<u8> {
+        self.digest
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -334,7 +342,6 @@ impl Default for ParseSettings {
     fn default() -> ParseSettings {
         ParseSettings {
             workaround_string_00af: false,
-
         }
     }
 }
